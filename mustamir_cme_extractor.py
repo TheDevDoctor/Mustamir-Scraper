@@ -1,12 +1,37 @@
 # mustamir_cme_extractor.py
-# Final version + resilient infinite retry for initial/recovery navigation
-# and infinite retry to enforce English language switch.
+# Adds optional S3 uploads for per-activity files and the master Excel.
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+from playwright.sync_api import sync_playwright
 from urllib.parse import urlsplit
 import pandas as pd
-import os, re, time, argparse, random
+import os, re, time, argparse, sys
+from typing import Optional
 
+# ---------- Optional S3 ----------
+_S3 = None
+def get_s3():
+    global _S3
+    if _S3 is None:
+        try:
+            import boto3
+            _S3 = boto3.client("s3")
+        except Exception as e:
+            raise RuntimeError(f"boto3 not available: {e}")
+    return _S3
+
+def s3_upload_file(local_path: str, bucket: str, key: str, retries: int = 5, backoff: float = 1.5):
+    s3 = get_s3()
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            s3.upload_file(local_path, bucket, key)
+            return True
+        except Exception as e:
+            last_err = e
+            time.sleep(backoff ** attempt)
+    raise RuntimeError(f"S3 upload failed for s3://{bucket}/{key}: {last_err}")
+
+# ---------- Paths & constants ----------
 ROOT_URL = "https://mustamir.scfhs.org.sa/account/external-activities"
 OUT_DIR = "out"
 ACTIVITY_DIR = os.path.join(OUT_DIR, "activities")
@@ -24,7 +49,6 @@ PAGINATOR_PAGE_BTN = f"{PAGINATOR_PAGES} .p-paginator-page.p-paginator-element.p
 ACTIVE_PAGE_BTN = f"{PAGINATOR_PAGES} .p-paginator-page.p-highlight"
 NEXT_BTN = f"{PAGINATOR_ROOT} .p-paginator-next.p-paginator-element"
 
-# English switch appears only when NOT already in English
 ENGLISH_SWITCH = "a.p-2.text-white.hover1:has-text('English')"
 
 VIEW_CLICKS = [
@@ -49,7 +73,7 @@ ACCRED_VALUE = f"{ACCRED_LABEL} + p"
 
 
 # ---------------- Utilities ----------------
-def log(msg):
+def log(msg): 
     print(msg, flush=True)
 
 def ensure_out():
@@ -67,87 +91,8 @@ def text_or_empty(loc):
     return ""
 
 
-# --------- Robust list connection (infinite retry) ---------
-def goto_list_with_retry(page, list_timeout_ms: int = 120000, wait_until: str = "networkidle"):
-    """
-    Keep trying to reach the list view until success.
-    Backoff: ~5s + small jitter, capped at ~120s between attempts.
-    """
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            log(f"[nav] Opening list (attempt {attempt}) …")
-            page.goto(ROOT_URL, wait_until=wait_until, timeout=max(90000, list_timeout_ms))
-            cont = get_list_container(page, timeout_ms=list_timeout_ms)
-            wait_rows_ready(cont)
-            log("[nav] List loaded.")
-            return cont
-        except Exception as e:
-            # Backoff before retry
-            backoff = min(120, 5 + attempt * 3)
-            sleep_s = backoff + random.uniform(0, 2.5)
-            log(f"[nav] Failed to load list: {e}\n       Retrying in {sleep_s:.1f}s …")
-            try:
-                page.wait_for_timeout(int(sleep_s * 1000))
-            except Exception:
-                time.sleep(sleep_s)
-
-
-# --------------- Force English (infinite retry) ---------------
-def enforce_english_with_retry(page, list_timeout_ms: int = 120000):
-    """
-    Ensure UI is in English. If the English switch is visible, we click it and verify again.
-    Success criteria: English switch is NOT visible (i.e., already English) AND list component is present.
-    Retries indefinitely with gentle backoff and hard reloads as needed.
-    """
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            # If switch is not visible, we assume we're already in English.
-            link = page.locator(ENGLISH_SWITCH).first
-            if not (link.count() and link.is_visible()):
-                # Verify list is usable
-                cont = get_list_container(page, timeout_ms=list_timeout_ms)
-                wait_rows_ready(cont)
-                log("[lang] English confirmed (toggle not visible).")
-                return cont
-
-            # Switch to English
-            log(f"[lang] English toggle visible — switching (attempt {attempt}) …")
-            link.click()
-            # Wait for SPA/network and the list component to reappear
-            try:
-                page.wait_for_load_state("networkidle", timeout=max(60000, list_timeout_ms))
-            except Exception:
-                pass
-
-            # After switching, verify: if the toggle disappears and list is present, we’re done
-            cont = get_list_container(page, timeout_ms=list_timeout_ms)
-            wait_rows_ready(cont)
-            link_after = page.locator(ENGLISH_SWITCH).first
-            if not (link_after.count() and link_after.is_visible()):
-                log("[lang] English switch succeeded.")
-                return cont
-
-            # If still visible, do a hard reload of the route and re-check
-            log("[lang] Toggle still visible after click — hard reload and retry …")
-            page.goto(ROOT_URL, wait_until="networkidle", timeout=max(90000, list_timeout_ms))
-
-        except Exception as e:
-            # Backoff and try again
-            backoff = min(120, 5 + attempt * 3)
-            sleep_s = backoff + random.uniform(0, 2.5)
-            log(f"[lang] Failed to enforce English: {e}\n       Retrying in {sleep_s:.1f}s …")
-            try:
-                page.wait_for_timeout(int(sleep_s * 1000))
-            except Exception:
-                time.sleep(sleep_s)
-
-
 # --------------- List helpers ---------------
-def get_list_container(page, timeout_ms: int = 90000):
+def get_list_container(page, timeout_ms: int = 120000):
     deadline = time.time() + (timeout_ms / 1000.0)
     last_err = None
     while time.time() < deadline:
@@ -161,10 +106,8 @@ def get_list_container(page, timeout_ms: int = 90000):
         except Exception as e:
             last_err = e
         time.sleep(0.3)
-    raise RuntimeError(
-        f"Could not find <app-list-external-activities> within {timeout_ms} ms"
-        + (f" (last error: {last_err})" if last_err else "")
-    )
+    raise RuntimeError(f"Could not find <app-list-external-activities> within {timeout_ms} ms"
+                       + (f" (last error: {last_err})" if last_err else ""))
 
 def tbody_html(container):
     try:
@@ -190,7 +133,7 @@ def wait_rows_ready(container):
     except:
         pass
 
-def active_page_number(container):
+def active_page_number(container) -> Optional[int]:
     try:
         btn = container.locator(ACTIVE_PAGE_BTN).first
         if not btn.count(): return None
@@ -245,6 +188,29 @@ def find_row_eye(row):
         except:
             pass
     return None
+
+def robust_switch_to_english(page):
+    # Keep trying until success
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            link = page.locator(ENGLISH_SWITCH).first
+            if link.count() and link.is_visible():
+                log(f"[info] Switching to English (attempt {attempts})…")
+                link.click()
+                page.wait_for_load_state("networkidle", timeout=60000)
+                page.wait_for_selector(LIST_COMPONENT, timeout=60000)
+                log("[info] English loaded.")
+                return
+            else:
+                # If not visible, maybe already English; verify list exists and "CPD Accredited Activities" header appears
+                if page.locator(LIST_COMPONENT).count():
+                    log("[info] English toggle not shown; assuming already English.")
+                    return
+        except Exception as e:
+            log(f"[warn] English switch attempt {attempts} failed: {e}")
+        time.sleep(min(2 * attempts, 10))
 
 
 # ---------- Detail page helpers ----------
@@ -325,54 +291,68 @@ def save_row_to_excels(row_dict: dict):
     else:
         master = pd.DataFrame([row_dict])
     master.to_excel(MASTER_XLSX, index=False)
+    return per_path  # so we can upload it immediately
 
 
 def recover_list(page, expected_page_no=None, list_timeout_ms: int = 120000):
-    """
-    Try normal recovery first; if it fails, fall back to an infinite-retry reload of the list
-    and re-enforce English before proceeding.
-    """
     try:
-        try:
-            page.wait_for_load_state("networkidle", timeout=list_timeout_ms)
-        except Exception:
-            pass
-        cont = get_list_container(page, timeout_ms=list_timeout_ms)
-        wait_rows_ready(cont)
-    except Exception as e:
-        log(f"[recover] Direct recovery failed: {e}. Retrying via hard reload …")
-        cont = goto_list_with_retry(page, list_timeout_ms=list_timeout_ms, wait_until="networkidle")
-        # Force English every time we do a hard reload
-        cont = enforce_english_with_retry(page, list_timeout_ms=list_timeout_ms)
-
+        page.wait_for_load_state("networkidle", timeout=list_timeout_ms)
+    except:
+        pass
+    cont = get_list_container(page, timeout_ms=list_timeout_ms)
+    wait_rows_ready(cont)
     if expected_page_no:
         try:
             cur = active_page_number(cont)
             if cur != expected_page_no:
                 fast_forward_to_page(cont, expected_page_no)
-        except Exception:
+        except:
             pass
     return cont, active_page_number(cont)
 
 
 # ------------- Main -------------
-def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int):
+def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int,
+         s3_bucket: Optional[str], s3_prefix: str, s3_master_every: int):
+
     ensure_out()
+    uploaded_rows = 0
+
+    def maybe_upload_activity(filepath: str):
+        if not s3_bucket:
+            return
+        rel = os.path.relpath(filepath, start=OUT_DIR).replace("\\", "/")
+        key = f"{s3_prefix.rstrip('/')}/{rel}"
+        log(f"[s3] upload {rel} -> s3://{s3_bucket}/{key}")
+        s3_upload_file(filepath, s3_bucket, key)
+
+    def maybe_upload_master(force=False):
+        nonlocal uploaded_rows
+        if not s3_bucket:
+            return
+        if force or uploaded_rows >= s3_master_every:
+            uploaded_rows = 0
+            rel = os.path.relpath(MASTER_XLSX, start=OUT_DIR).replace("\\", "/")
+            key = f"{s3_prefix.rstrip('/')}/{rel}"
+            log(f"[s3] upload master -> s3://{s3_bucket}/{key}")
+            s3_upload_file(MASTER_XLSX, s3_bucket, key)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         ctx = browser.new_context()
-        # More forgiving defaults for slow responses
-        ctx.set_default_timeout(max(list_timeout_ms, 120000))
-        ctx.set_default_navigation_timeout(max(list_timeout_ms, 120000))
-
         page = ctx.new_page()
-        log("[step] Go to root list (with infinite retry)")
-        cont = goto_list_with_retry(page, list_timeout_ms=list_timeout_ms, wait_until="networkidle")
+        log("[step] Go to root list")
+        # Robust navigation: keep trying until connected
+        while True:
+            try:
+                page.goto(ROOT_URL, wait_until="networkidle", timeout=90000)
+                break
+            except Exception as e:
+                log(f"[warn] Initial goto failed, retrying in 3s: {e}")
+                time.sleep(3)
 
-        # NEW: enforce English with infinite retry
-        cont = enforce_english_with_retry(page, list_timeout_ms=list_timeout_ms)
+        robust_switch_to_english(page)
 
-        # Re-acquire container (belt-and-braces)
         cont = get_list_container(page, timeout_ms=list_timeout_ms)
         wait_rows_ready(cont)
 
@@ -405,41 +385,44 @@ def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int):
                     prev_html = tbody_html(cont)
                     with page.expect_navigation():
                         eye.click()
-
                     try:
                         record = extract_detail(page)
                         log(f"[ok] extracted Activity ID={record.get('Activity ID', '?')}")
-                        save_row_to_excels(record)
+                        per_file = save_row_to_excels(record)
+                        uploaded_rows += 1
+                        # upload per-activity file immediately
+                        maybe_upload_activity(per_file)
+                        # upload master periodically
+                        maybe_upload_master(force=False)
                     except Exception as e:
                         log(f"[warn] extraction failed on page {n}, row {r+1}: {e}")
 
                     try:
                         page.get_by_role("button", name="Back", exact=True).click()
-                    except Exception:
+                    except:
                         page.go_back(wait_until="networkidle", timeout=60000)
-
                     cont, _ = recover_list(page, expected_page_no=n, list_timeout_ms=list_timeout_ms)
-
                 except Exception as e:
                     log(f"[warn] Row {r+1} failure: {e}")
                     try:
                         cont, _ = recover_list(page, expected_page_no=n, list_timeout_ms=list_timeout_ms)
-                    except Exception as e2:
-                        log(f"[warn] Recovery after row failure also failed: {e2}. Retrying list (infinite) …")
-                        cont = goto_list_with_retry(page, list_timeout_ms=list_timeout_ms, wait_until="networkidle")
-                        cont = enforce_english_with_retry(page, list_timeout_ms=list_timeout_ms)
+                    except:
+                        continue
 
             processed_pages += 1
+            # force a master upload at the end of a page, too
+            maybe_upload_master(force=True)
+
             if max_pages and processed_pages >= max_pages:
                 log("[done] Reached --max-pages cap.")
                 break
-
             if not click_next(cont):
                 log("[done] Reached last page or next disabled.")
                 break
-
             current_page = active_page_number(cont) or (current_page + 1)
 
+        # final master upload
+        maybe_upload_master(force=True)
         browser.close()
 
 
@@ -453,6 +436,22 @@ if __name__ == "__main__":
                     help="Run headless.")
     ap.add_argument("--list-timeout-ms", type=int, default=120000,
                     help="Timeout in ms to wait for <app-list-external-activities> to appear/settle.")
+
+    # S3 options (optional)
+    ap.add_argument("--s3-bucket", type=str, default="",
+                    help="If set, upload outputs to this S3 bucket.")
+    ap.add_argument("--s3-prefix", type=str, default="runs/current",
+                    help="Key prefix under which to place files (e.g., runs/2025-11-05).")
+    ap.add_argument("--s3-master-upload-every", type=int, default=25,
+                    help="Upload master Excel every N rows (plus end-of-page/end-of-run).")
+
     args = ap.parse_args()
-    main(max_pages=args.max_pages, headless=args.headless,
-         start_page=args.start_page, list_timeout_ms=args.list_timeout_ms)
+    main(
+        max_pages=args.max_pages,
+        headless=args.headless,
+        start_page=args.start_page,
+        list_timeout_ms=args.list_timeout_ms,
+        s3_bucket=(args.s3_bucket or None),
+        s3_prefix=args.s3_prefix,
+        s3_master_every=max(1, args.s3_master_upload_every),
+    )
