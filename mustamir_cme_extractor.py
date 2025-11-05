@@ -1,5 +1,7 @@
 # mustamir_cme_extractor.py
-# Adds optional S3 uploads for per-activity files and the master Excel.
+# Adds optional S3 uploads and SHARDING (stride across pages).
+# Shard args: --shard-count N --shard-index I (0-based). When N>1, each shard processes
+# pages: start_page + I, then advances by +N pages each loop.
 
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlsplit
@@ -35,7 +37,8 @@ def s3_upload_file(local_path: str, bucket: str, key: str, retries: int = 5, bac
 ROOT_URL = "https://mustamir.scfhs.org.sa/account/external-activities"
 OUT_DIR = "out"
 ACTIVITY_DIR = os.path.join(OUT_DIR, "activities")
-MASTER_XLSX = os.path.join(OUT_DIR, "external_activities_master.xlsx")
+# We'll set MASTER_XLSX dynamically in main (to avoid cross-shard clashes)
+MASTER_XLSX = None  # set later
 
 # ---- Selectors ----
 LIST_COMPONENT = "app-list-external-activities"
@@ -73,7 +76,7 @@ ACCRED_VALUE = f"{ACCRED_LABEL} + p"
 
 
 # ---------------- Utilities ----------------
-def log(msg): 
+def log(msg):
     print(msg, flush=True)
 
 def ensure_out():
@@ -163,6 +166,13 @@ def click_next(container, retries=3):
         time.sleep(0.25)
     return False
 
+def click_next_k(container, k: int) -> bool:
+    """Advance k pages via the 'next' button. Returns True if all k succeeded."""
+    for _ in range(k):
+        if not click_next(container):
+            return False
+    return True
+
 def fast_forward_to_page(container, target_page, hard_cap_steps=4000):
     cur = active_page_number(container)
     if cur is None:
@@ -190,7 +200,6 @@ def find_row_eye(row):
     return None
 
 def robust_switch_to_english(page):
-    # Keep trying until success
     attempts = 0
     while True:
         attempts += 1
@@ -204,7 +213,7 @@ def robust_switch_to_english(page):
                 log("[info] English loaded.")
                 return
             else:
-                # If not visible, maybe already English; verify list exists and "CPD Accredited Activities" header appears
+                # If not visible, we might already be in English. Verify list exists.
                 if page.locator(LIST_COMPONENT).count():
                     log("[info] English toggle not shown; assuming already English.")
                     return
@@ -282,6 +291,8 @@ def save_row_to_excels(row_dict: dict):
     act_id = row_dict.get("Activity ID", "unknown")
     per_path = os.path.join(ACTIVITY_DIR, f"detail_{act_id}.xlsx")
     pd.DataFrame([row_dict]).to_excel(per_path, index=False)
+
+    # Use shard-specific master (MASTER_XLSX is set in main)
     if os.path.exists(MASTER_XLSX):
         master = pd.read_excel(MASTER_XLSX)
         all_cols = list(dict.fromkeys(list(master.columns) + list(row_dict.keys())))
@@ -313,9 +324,25 @@ def recover_list(page, expected_page_no=None, list_timeout_ms: int = 120000):
 
 # ------------- Main -------------
 def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int,
-         s3_bucket: Optional[str], s3_prefix: str, s3_master_every: int):
+         s3_bucket: Optional[str], s3_prefix: str, s3_master_every: int,
+         shard_count:int, shard_index:int):
 
+    # ---- validate shards ----
+    if shard_count < 1:
+        raise ValueError("--shard-count must be >= 1")
+    if not (0 <= shard_index < shard_count):
+        raise ValueError("--shard-index must be in [0, shard-count-1]")
+
+    # shard-aware paths & prefixes
+    global MASTER_XLSX
+    shard_suffix = "" if shard_count == 1 else f"_shard{shard_index+1}of{shard_count}"
+    MASTER_XLSX = os.path.join(OUT_DIR, f"external_activities_master{shard_suffix}.xlsx")
     ensure_out()
+
+    if s3_bucket:
+        # nest each shard under its own directory to avoid collisions
+        s3_prefix = f"{s3_prefix.rstrip('/')}/shard_{shard_index+1}of{shard_count}"
+
     uploaded_rows = 0
 
     def maybe_upload_activity(filepath: str):
@@ -341,7 +368,7 @@ def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int,
         browser = p.chromium.launch(headless=headless)
         ctx = browser.new_context()
         page = ctx.new_page()
-        log("[step] Go to root list")
+        log(f"[step] Shard {shard_index+1}/{shard_count} starting. Go to root list")
         # Robust navigation: keep trying until connected
         while True:
             try:
@@ -356,19 +383,21 @@ def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int,
         cont = get_list_container(page, timeout_ms=list_timeout_ms)
         wait_rows_ready(cont)
 
-        if start_page and start_page > 1:
-            log(f"[step] Fast-forwarding to start page {start_page} …")
+        # Effective start page for this shard: start_page + shard_index
+        eff_start = max(1, start_page) + (shard_index if shard_count > 1 else 0)
+        if eff_start > 1:
+            log(f"[step] Fast-forwarding to shard start page {eff_start} …")
             try:
-                fast_forward_to_page(cont, start_page)
+                fast_forward_to_page(cont, eff_start)
             except Exception as e:
                 log(f"[warn] Could not fast-forward neatly: {e}")
 
         processed_pages = 0
-        current_page = active_page_number(cont) or start_page or 1
+        current_page = active_page_number(cont) or eff_start
 
         while True:
             n = current_page
-            log(f"[page] Processing page {n}")
+            log(f"[page][shard {shard_index+1}/{shard_count}] Processing page {n}")
             rows = cont.locator(ROW_SELECTOR)
             row_count = rows.count()
             log(f"[info] rows found: {row_count}")
@@ -390,9 +419,7 @@ def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int,
                         log(f"[ok] extracted Activity ID={record.get('Activity ID', '?')}")
                         per_file = save_row_to_excels(record)
                         uploaded_rows += 1
-                        # upload per-activity file immediately
                         maybe_upload_activity(per_file)
-                        # upload master periodically
                         maybe_upload_master(force=False)
                     except Exception as e:
                         log(f"[warn] extraction failed on page {n}, row {r+1}: {e}")
@@ -410,18 +437,21 @@ def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int,
                         continue
 
             processed_pages += 1
-            # force a master upload at the end of a page, too
             maybe_upload_master(force=True)
 
+            # Respect --max-pages as "pages for THIS shard"
             if max_pages and processed_pages >= max_pages:
-                log("[done] Reached --max-pages cap.")
+                log("[done] Reached --max-pages cap for this shard.")
                 break
-            if not click_next(cont):
-                log("[done] Reached last page or next disabled.")
-                break
-            current_page = active_page_number(cont) or (current_page + 1)
 
-        # final master upload
+            # Move to the *next page for this shard*:
+            # stride = shard_count; from current page, advance N pages via 'next' button
+            stride = shard_count if shard_count > 1 else 1
+            if not click_next_k(cont, stride):
+                log("[done] Reached last page (or next disabled) for this shard.")
+                break
+            current_page = (active_page_number(cont) or (current_page + stride))
+
         maybe_upload_master(force=True)
         browser.close()
 
@@ -429,9 +459,9 @@ def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int,
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-pages", type=int, default=0,
-                    help="How many pages to process (0 = all until paginator ends).")
+                    help="How many pages THIS SHARD will process (0 = until paginator ends for this shard).")
     ap.add_argument("--start-page", type=int, default=1,
-                    help="Page number to start from (1-based).")
+                    help="Global 1-based start page. With sharding, effective start = start-page + shard-index.")
     ap.add_argument("--headless", action="store_true",
                     help="Run headless.")
     ap.add_argument("--list-timeout-ms", type=int, default=120000,
@@ -445,6 +475,12 @@ if __name__ == "__main__":
     ap.add_argument("--s3-master-upload-every", type=int, default=25,
                     help="Upload master Excel every N rows (plus end-of-page/end-of-run).")
 
+    # Sharding
+    ap.add_argument("--shard-count", type=int, default=1,
+                    help="Total number of parallel shards (default 1 = no sharding).")
+    ap.add_argument("--shard-index", type=int, default=0,
+                    help="Zero-based index of this shard (0..shard-count-1).")
+
     args = ap.parse_args()
     main(
         max_pages=args.max_pages,
@@ -454,4 +490,6 @@ if __name__ == "__main__":
         s3_bucket=(args.s3_bucket or None),
         s3_prefix=args.s3_prefix,
         s3_master_every=max(1, args.s3_master_upload_every),
+        shard_count=args.shard_count,
+        shard_index=args.shard_index,
     )
