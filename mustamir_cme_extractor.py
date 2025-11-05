@@ -1,10 +1,10 @@
 # mustamir_cme_extractor.py
-# Final version: default max-pages=0 (all pages), and per-activity files in "out/activities/"
+# Final version + resilient infinite retry for initial and recovery navigation
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 from urllib.parse import urlsplit
 import pandas as pd
-import os, re, time, argparse
+import os, re, time, argparse, math, random
 
 ROOT_URL = "https://mustamir.scfhs.org.sa/account/external-activities"
 OUT_DIR = "out"
@@ -47,11 +47,15 @@ ACCRED_VALUE = f"{ACCRED_LABEL} + p"
 
 
 # ---------------- Utilities ----------------
-def log(msg): print(msg, flush=True)
+def log(msg): 
+    print(msg, flush=True)
+
 def ensure_out():
     os.makedirs(ACTIVITY_DIR, exist_ok=True)
+
 def clean_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
+
 def text_or_empty(loc):
     try:
         if loc.count():
@@ -59,6 +63,35 @@ def text_or_empty(loc):
     except:
         pass
     return ""
+
+
+# --------- Robust list connection (infinite retry) ---------
+def goto_list_with_retry(page, list_timeout_ms: int = 120000, wait_until: str = "networkidle"):
+    """
+    Keep trying to reach the list view until success.
+    Exponential backoff: 5s, 8s, 13s ... capped at 120s + small jitter.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            log(f"[nav] Opening list (attempt {attempt}) …")
+            page.goto(ROOT_URL, wait_until=wait_until, timeout=max(90000, list_timeout_ms))
+            # If page loaded but SPA still hydrating, the component may appear slightly later
+            cont = get_list_container(page, timeout_ms=list_timeout_ms)
+            wait_rows_ready(cont)
+            log("[nav] List loaded.")
+            return cont
+        except Exception as e:
+            # Backoff before retry
+            backoff = min(120, 5 + attempt * 3)  # linear/exponential-ish; capped at 120s
+            jitter = random.uniform(0, 2.5)
+            sleep_s = backoff + jitter
+            log(f"[nav] Failed to load list: {e}\n       Retrying in {sleep_s:.1f}s …")
+            try:
+                page.wait_for_timeout(int(sleep_s * 1000))
+            except Exception:
+                time.sleep(sleep_s)
 
 
 # --------------- List helpers ---------------
@@ -76,12 +109,16 @@ def get_list_container(page, timeout_ms: int = 90000):
         except Exception as e:
             last_err = e
         time.sleep(0.3)
-    raise RuntimeError(f"Could not find <app-list-external-activities> within {timeout_ms} ms"
-                       + (f" (last error: {last_err})" if last_err else ""))
+    raise RuntimeError(
+        f"Could not find <app-list-external-activities> within {timeout_ms} ms"
+        + (f" (last error: {last_err})" if last_err else "")
+    )
 
 def tbody_html(container):
-    try: return container.locator(TBODY_SELECTOR).first.inner_html() or ""
-    except: return ""
+    try: 
+        return container.locator(TBODY_SELECTOR).first.inner_html() or ""
+    except: 
+        return ""
 
 def wait_spinner_gone(container, timeout_s=30):
     start = time.time()
@@ -90,13 +127,16 @@ def wait_spinner_gone(container, timeout_s=30):
             sp = container.locator(SPINNER_SELECTOR)
             if sp.count() == 0 or not sp.first.is_visible():
                 return
-        except: return
+        except: 
+            return
         time.sleep(0.15)
 
 def wait_rows_ready(container):
     wait_spinner_gone(container, timeout_s=30)
-    try: container.wait_for_selector(ROW_SELECTOR, timeout=5000)
-    except: pass
+    try: 
+        container.wait_for_selector(ROW_SELECTOR, timeout=5000)
+    except: 
+        pass
 
 def active_page_number(container):
     try:
@@ -104,13 +144,15 @@ def active_page_number(container):
         if not btn.count(): return None
         txt = btn.inner_text().strip()
         return int(txt) if txt.isdigit() else None
-    except: return None
+    except: 
+        return None
 
 def wait_tbody_swap(container, prev_html, timeout_s=10):
     start = time.time()
     while time.time() - start < timeout_s:
         cur = tbody_html(container)
-        if cur and cur != prev_html: return True
+        if cur and cur != prev_html: 
+            return True
         time.sleep(0.1)
     return False
 
@@ -121,7 +163,8 @@ def click_next(container, retries=3):
         if btn.count() and btn.is_enabled():
             btn.click()
             wait_rows_ready(container)
-            if wait_tbody_swap(container, prev, 10): return True
+            if wait_tbody_swap(container, prev, 10): 
+                return True
         time.sleep(0.25)
     return False
 
@@ -132,7 +175,8 @@ def fast_forward_to_page(container, target_page, hard_cap_steps=4000):
         cur = active_page_number(container)
     steps = 0
     while cur and cur < target_page and steps < hard_cap_steps:
-        if not click_next(container): break
+        if not click_next(container): 
+            break
         cur = active_page_number(container) or (cur + 1)
         steps += 1
     if cur != target_page:
@@ -146,7 +190,8 @@ def find_row_eye(row):
         try:
             if loc.count() and loc.is_visible() and loc.is_enabled():
                 return loc
-        except: pass
+        except: 
+            pass
     return None
 
 def switch_to_english_if_needed(page):
@@ -167,12 +212,16 @@ def wait_detail_ready(page):
     deadline = time.time() + 30
     while time.time() < deadline:
         try:
-            if page.locator(".p-progress-spinner").count() == 0: break
-        except: break
+            if page.locator(".p-progress-spinner").count() == 0: 
+                break
+        except: 
+            break
         time.sleep(0.15)
     page.wait_for_selector(H4_ACTIVITY, timeout=30000)
-    try: page.wait_for_selector(H5_SELECTOR, timeout=30000)
-    except: pass
+    try: 
+        page.wait_for_selector(H5_SELECTOR, timeout=30000)
+    except: 
+        pass
 
 def extract_activity_id_from_url(url: str) -> str:
     path = urlsplit(url).path.strip("/")
@@ -191,28 +240,34 @@ def extract_detail(page) -> dict:
     for i in range(groups.count()):
         g = groups.nth(i)
         label = clean_spaces(text_or_empty(g.locator(LABEL_IN_GROUP).first))
-        if not label: continue
+        if not label: 
+            continue
         vals = [clean_spaces(text_or_empty(p)) for p in g.locator(P_IN_GROUP).all()]
         vals = [v for v in vals if v]
-        if vals: data[label] = " | ".join(vals)
+        if vals: 
+            data[label] = " | ".join(vals)
 
     h5s = page.locator(H5_SELECTOR)
     for i in range(h5s.count()):
         h5 = h5s.nth(i)
         title = clean_spaces(text_or_empty(h5))
-        if not title: continue
+        if not title: 
+            continue
         if title.strip().lower() == "scientific program":
             try:
                 next_div = h5.locator(H5_NEXT_DIV_XPATH).first
                 next_div.locator(SCIPRO_COMPONENT).wait_for(state="attached", timeout=20000)
-            except Exception: pass
+            except Exception: 
+                pass
         next_div = h5.locator(H5_NEXT_DIV_XPATH).first
         section_text = clean_spaces(text_or_empty(next_div))
-        if section_text: data[title] = section_text
+        if section_text: 
+            data[title] = section_text
 
     accred = page.locator(ACCRED_VALUE).first
     val = clean_spaces(text_or_empty(accred))
-    if val: data["Accredited CME Hours"] = val
+    if val: 
+        data["Accredited CME Hours"] = val
     return data
 
 
@@ -232,17 +287,28 @@ def save_row_to_excels(row_dict: dict):
     master.to_excel(MASTER_XLSX, index=False)
 
 
-def recover_list(page, expected_page_no=None, list_timeout_ms: int = 90000):
-    try: page.wait_for_load_state("networkidle", timeout=list_timeout_ms)
-    except: pass
-    cont = get_list_container(page, timeout_ms=list_timeout_ms)
-    wait_rows_ready(cont)
+def recover_list(page, expected_page_no=None, list_timeout_ms: int = 120000):
+    """
+    Try normal recovery first; if it fails, fall back to an infinite-retry reload of the list.
+    """
+    try:
+        try: 
+            page.wait_for_load_state("networkidle", timeout=list_timeout_ms)
+        except Exception:
+            pass
+        cont = get_list_container(page, timeout_ms=list_timeout_ms)
+        wait_rows_ready(cont)
+    except Exception as e:
+        log(f"[recover] Direct recovery failed: {e}. Retrying via hard reload …")
+        cont = goto_list_with_retry(page, list_timeout_ms=list_timeout_ms, wait_until="networkidle")
+
     if expected_page_no:
         try:
             cur = active_page_number(cont)
             if cur != expected_page_no:
                 fast_forward_to_page(cont, expected_page_no)
-        except: pass
+        except Exception:
+            pass
     return cont, active_page_number(cont)
 
 
@@ -252,18 +318,25 @@ def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         ctx = browser.new_context()
+        # More forgiving default timeouts for slow responses
+        ctx.set_default_timeout(max(list_timeout_ms, 120000))
+        ctx.set_default_navigation_timeout(max(list_timeout_ms, 120000))
+
         page = ctx.new_page()
-        log("[step] Go to root list")
-        page.goto(ROOT_URL, wait_until="networkidle", timeout=90000)
+        log("[step] Go to root list (with infinite retry)")
+        cont = goto_list_with_retry(page, list_timeout_ms=list_timeout_ms, wait_until="networkidle")
         switch_to_english_if_needed(page)
 
+        # Re-acquire container after potential language switch
         cont = get_list_container(page, timeout_ms=list_timeout_ms)
         wait_rows_ready(cont)
 
         if start_page and start_page > 1:
             log(f"[step] Fast-forwarding to start page {start_page} …")
-            try: fast_forward_to_page(cont, start_page)
-            except Exception as e: log(f"[warn] Could not fast-forward neatly: {e}")
+            try: 
+                fast_forward_to_page(cont, start_page)
+            except Exception as e: 
+                log(f"[warn] Could not fast-forward neatly: {e}")
 
         processed_pages = 0
         current_page = active_page_number(cont) or start_page or 1
@@ -283,31 +356,45 @@ def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int):
                     if not eye:
                         log(f"[skip] no 'view' action for row {r+1} on page {n}")
                         continue
+
                     prev_html = tbody_html(cont)
                     with page.expect_navigation():
                         eye.click()
+
                     try:
                         record = extract_detail(page)
                         log(f"[ok] extracted Activity ID={record.get('Activity ID', '?')}")
                         save_row_to_excels(record)
                     except Exception as e:
                         log(f"[warn] extraction failed on page {n}, row {r+1}: {e}")
-                    try: page.get_by_role("button", name="Back", exact=True).click()
-                    except: page.go_back(wait_until="networkidle", timeout=60000)
+
+                    try:
+                        page.get_by_role("button", name="Back", exact=True).click()
+                    except Exception:
+                        # fallback
+                        page.go_back(wait_until="networkidle", timeout=60000)
+
                     cont, _ = recover_list(page, expected_page_no=n, list_timeout_ms=list_timeout_ms)
+
                 except Exception as e:
                     log(f"[warn] Row {r+1} failure: {e}")
-                    try: cont, _ = recover_list(page, expected_page_no=n, list_timeout_ms=list_timeout_ms)
-                    except: continue
+                    try: 
+                        cont, _ = recover_list(page, expected_page_no=n, list_timeout_ms=list_timeout_ms)
+                    except Exception as e2: 
+                        log(f"[warn] Recovery after row failure also failed: {e2}. Retrying list (infinite) …")
+                        cont = goto_list_with_retry(page, list_timeout_ms=list_timeout_ms, wait_until="networkidle")
 
             processed_pages += 1
             if max_pages and processed_pages >= max_pages:
                 log("[done] Reached --max-pages cap.")
                 break
+
             if not click_next(cont):
                 log("[done] Reached last page or next disabled.")
                 break
+
             current_page = active_page_number(cont) or (current_page + 1)
+
         browser.close()
 
 
@@ -319,7 +406,7 @@ if __name__ == "__main__":
                     help="Page number to start from (1-based).")
     ap.add_argument("--headless", action="store_true",
                     help="Run headless.")
-    ap.add_argument("--list-timeout-ms", type=int, default=90000,
+    ap.add_argument("--list-timeout-ms", type=int, default=120000,
                     help="Timeout in ms to wait for <app-list-external-activities> to appear/settle.")
     args = ap.parse_args()
     main(max_pages=args.max_pages, headless=args.headless,
