@@ -1,13 +1,13 @@
 # mustamir_cme_extractor.py
 # Adds optional S3 uploads and SHARDING (stride across pages).
-# Shard args: --shard-count N --shard-index I (0-based). When N>1, each shard processes
-# pages: start_page + I, then advances by +N pages each loop.
+# NEW: --pages-file to process ONLY specific pages (e.g., missing pages list).
+# When --pages-file is provided, shards divide that list round-robin (no overlap).
 
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlsplit
 import pandas as pd
 import os, re, time, argparse, sys
-from typing import Optional
+from typing import Optional, List, Set
 
 # ---------- Optional S3 ----------
 _S3 = None
@@ -37,8 +37,7 @@ def s3_upload_file(local_path: str, bucket: str, key: str, retries: int = 5, bac
 ROOT_URL = "https://mustamir.scfhs.org.sa/account/external-activities"
 OUT_DIR = "out"
 ACTIVITY_DIR = os.path.join(OUT_DIR, "activities")
-# We'll set MASTER_XLSX dynamically in main (to avoid cross-shard clashes)
-MASTER_XLSX = None  # set later
+MASTER_XLSX = None  # set in main per shard
 
 # ---- Selectors ----
 LIST_COMPONENT = "app-list-external-activities"
@@ -74,10 +73,8 @@ SCIPRO_COMPONENT = "external-activity-agenda-list"
 ACCRED_LABEL = "label:has-text('Accredited CME Hours')"
 ACCRED_VALUE = f"{ACCRED_LABEL} + p"
 
-
 # ---------------- Utilities ----------------
-def log(msg):
-    print(msg, flush=True)
+def log(msg): print(msg, flush=True)
 
 def ensure_out():
     os.makedirs(ACTIVITY_DIR, exist_ok=True)
@@ -92,7 +89,6 @@ def text_or_empty(loc):
     except:
         pass
     return ""
-
 
 # --------------- List helpers ---------------
 def get_list_container(page, timeout_ms: int = 120000):
@@ -113,10 +109,8 @@ def get_list_container(page, timeout_ms: int = 120000):
                        + (f" (last error: {last_err})" if last_err else ""))
 
 def tbody_html(container):
-    try:
-        return container.locator(TBODY_SELECTOR).first.inner_html() or ""
-    except:
-        return ""
+    try: return container.locator(TBODY_SELECTOR).first.inner_html() or ""
+    except: return ""
 
 def wait_spinner_gone(container, timeout_s=30):
     start = time.time()
@@ -125,16 +119,13 @@ def wait_spinner_gone(container, timeout_s=30):
             sp = container.locator(SPINNER_SELECTOR)
             if sp.count() == 0 or not sp.first.is_visible():
                 return
-        except:
-            return
+        except: return
         time.sleep(0.15)
 
 def wait_rows_ready(container):
     wait_spinner_gone(container, timeout_s=30)
-    try:
-        container.wait_for_selector(ROW_SELECTOR, timeout=5000)
-    except:
-        pass
+    try: container.wait_for_selector(ROW_SELECTOR, timeout=5000)
+    except: pass
 
 def active_page_number(container) -> Optional[int]:
     try:
@@ -149,8 +140,7 @@ def wait_tbody_swap(container, prev_html, timeout_s=10):
     start = time.time()
     while time.time() - start < timeout_s:
         cur = tbody_html(container)
-        if cur and cur != prev_html:
-            return True
+        if cur and cur != prev_html: return True
         time.sleep(0.1)
     return False
 
@@ -161,13 +151,11 @@ def click_next(container, retries=3):
         if btn.count() and btn.is_enabled():
             btn.click()
             wait_rows_ready(container)
-            if wait_tbody_swap(container, prev, 10):
-                return True
+            if wait_tbody_swap(container, prev, 10): return True
         time.sleep(0.25)
     return False
 
 def click_next_k(container, k: int) -> bool:
-    """Advance k pages via the 'next' button. Returns True if all k succeeded."""
     for _ in range(k):
         if not click_next(container):
             return False
@@ -180,13 +168,11 @@ def fast_forward_to_page(container, target_page, hard_cap_steps=4000):
         cur = active_page_number(container)
     steps = 0
     while cur and cur < target_page and steps < hard_cap_steps:
-        if not click_next(container):
-            break
+        if not click_next(container): break
         cur = active_page_number(container) or (cur + 1)
         steps += 1
     if cur != target_page:
         log(f"[warn] Fast-forward ended on page {cur}, expected {target_page}")
-
 
 # ------------- Row helpers -------------
 def find_row_eye(row):
@@ -195,8 +181,7 @@ def find_row_eye(row):
         try:
             if loc.count() and loc.is_visible() and loc.is_enabled():
                 return loc
-        except:
-            pass
+        except: pass
     return None
 
 def robust_switch_to_english(page):
@@ -213,7 +198,6 @@ def robust_switch_to_english(page):
                 log("[info] English loaded.")
                 return
             else:
-                # If not visible, we might already be in English. Verify list exists.
                 if page.locator(LIST_COMPONENT).count():
                     log("[info] English toggle not shown; assuming already English.")
                     return
@@ -221,22 +205,17 @@ def robust_switch_to_english(page):
             log(f"[warn] English switch attempt {attempts} failed: {e}")
         time.sleep(min(2 * attempts, 10))
 
-
 # ---------- Detail page helpers ----------
 def wait_detail_ready(page):
     deadline = time.time() + 30
     while time.time() < deadline:
         try:
-            if page.locator(".p-progress-spinner").count() == 0:
-                break
-        except:
-            break
+            if page.locator(".p-progress-spinner").count() == 0: break
+        except: break
         time.sleep(0.15)
     page.wait_for_selector(H4_ACTIVITY, timeout=30000)
-    try:
-        page.wait_for_selector(H5_SELECTOR, timeout=30000)
-    except:
-        pass
+    try: page.wait_for_selector(H5_SELECTOR, timeout=30000)
+    except: pass
 
 def extract_activity_id_from_url(url: str) -> str:
     path = urlsplit(url).path.strip("/")
@@ -255,36 +234,29 @@ def extract_detail(page) -> dict:
     for i in range(groups.count()):
         g = groups.nth(i)
         label = clean_spaces(text_or_empty(g.locator(LABEL_IN_GROUP).first))
-        if not label:
-            continue
+        if not label: continue
         vals = [clean_spaces(text_or_empty(p)) for p in g.locator(P_IN_GROUP).all()]
         vals = [v for v in vals if v]
-        if vals:
-            data[label] = " | ".join(vals)
+        if vals: data[label] = " | ".join(vals)
 
     h5s = page.locator(H5_SELECTOR)
     for i in range(h5s.count()):
         h5 = h5s.nth(i)
         title = clean_spaces(text_or_empty(h5))
-        if not title:
-            continue
+        if not title: continue
         if title.strip().lower() == "scientific program":
             try:
                 next_div = h5.locator(H5_NEXT_DIV_XPATH).first
                 next_div.locator(SCIPRO_COMPONENT).wait_for(state="attached", timeout=20000)
-            except Exception:
-                pass
+            except Exception: pass
         next_div = h5.locator(H5_NEXT_DIV_XPATH).first
         section_text = clean_spaces(text_or_empty(next_div))
-        if section_text:
-            data[title] = section_text
+        if section_text: data[title] = section_text
 
     accred = page.locator(ACCRED_VALUE).first
     val = clean_spaces(text_or_empty(accred))
-    if val:
-        data["Accredited CME Hours"] = val
+    if val: data["Accredited CME Hours"] = val
     return data
-
 
 def save_row_to_excels(row_dict: dict):
     ensure_out()
@@ -292,7 +264,6 @@ def save_row_to_excels(row_dict: dict):
     per_path = os.path.join(ACTIVITY_DIR, f"detail_{act_id}.xlsx")
     pd.DataFrame([row_dict]).to_excel(per_path, index=False)
 
-    # Use shard-specific master (MASTER_XLSX is set in main)
     if os.path.exists(MASTER_XLSX):
         master = pd.read_excel(MASTER_XLSX)
         all_cols = list(dict.fromkeys(list(master.columns) + list(row_dict.keys())))
@@ -302,14 +273,11 @@ def save_row_to_excels(row_dict: dict):
     else:
         master = pd.DataFrame([row_dict])
     master.to_excel(MASTER_XLSX, index=False)
-    return per_path  # so we can upload it immediately
-
+    return per_path
 
 def recover_list(page, expected_page_no=None, list_timeout_ms: int = 120000):
-    try:
-        page.wait_for_load_state("networkidle", timeout=list_timeout_ms)
-    except:
-        pass
+    try: page.wait_for_load_state("networkidle", timeout=list_timeout_ms)
+    except: pass
     cont = get_list_container(page, timeout_ms=list_timeout_ms)
     wait_rows_ready(cont)
     if expected_page_no:
@@ -317,15 +285,30 @@ def recover_list(page, expected_page_no=None, list_timeout_ms: int = 120000):
             cur = active_page_number(cont)
             if cur != expected_page_no:
                 fast_forward_to_page(cont, expected_page_no)
-        except:
-            pass
+        except: pass
     return cont, active_page_number(cont)
 
+# ---------- Pages file helpers ----------
+def parse_pages_file(path: str) -> List[int]:
+    if not path: return []
+    raw = open(path, "r", encoding="utf-8", errors="ignore").read()
+    # accept any separators (newline, comma, space)
+    tokens = re.findall(r"\d+", raw)
+    pages = sorted({int(t) for t in tokens if t.isdigit() and int(t) >= 1})
+    return pages
+
+def shard_pages(pages: List[int], shard_count: int, shard_index: int) -> List[int]:
+    """Round-robin split to avoid overlaps; stable order preserved."""
+    out = []
+    for i, p in enumerate(pages):
+        if i % shard_count == shard_index:
+            out.append(p)
+    return out
 
 # ------------- Main -------------
 def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int,
          s3_bucket: Optional[str], s3_prefix: str, s3_master_every: int,
-         shard_count:int, shard_index:int):
+         shard_count:int, shard_index:int, pages_file: Optional[str]):
 
     # ---- validate shards ----
     if shard_count < 1:
@@ -333,21 +316,26 @@ def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int,
     if not (0 <= shard_index < shard_count):
         raise ValueError("--shard-index must be in [0, shard-count-1]")
 
-    # shard-aware paths & prefixes
+    # shard-aware paths
     global MASTER_XLSX
     shard_suffix = "" if shard_count == 1 else f"_shard{shard_index+1}of{shard_count}"
     MASTER_XLSX = os.path.join(OUT_DIR, f"external_activities_master{shard_suffix}.xlsx")
     ensure_out()
 
     if s3_bucket:
-        # nest each shard under its own directory to avoid collisions
         s3_prefix = f"{s3_prefix.rstrip('/')}/shard_{shard_index+1}of{shard_count}"
 
-    uploaded_rows = 0
+    # If a pages-file was provided, load and split it per shard
+    target_pages: List[int] = []
+    if pages_file:
+        all_pages = parse_pages_file(pages_file)
+        target_pages = shard_pages(all_pages, shard_count, shard_index)
+        log(f"[info] Loaded {len(all_pages)} pages from {pages_file}; "
+            f"this shard will process {len(target_pages)} of them.")
 
+    uploaded_rows = 0
     def maybe_upload_activity(filepath: str):
-        if not s3_bucket:
-            return
+        if not s3_bucket: return
         rel = os.path.relpath(filepath, start=OUT_DIR).replace("\\", "/")
         key = f"{s3_prefix.rstrip('/')}/{rel}"
         log(f"[s3] upload {rel} -> s3://{s3_bucket}/{key}")
@@ -355,8 +343,7 @@ def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int,
 
     def maybe_upload_master(force=False):
         nonlocal uploaded_rows
-        if not s3_bucket:
-            return
+        if not s3_bucket: return
         if force or uploaded_rows >= s3_master_every:
             uploaded_rows = 0
             rel = os.path.relpath(MASTER_XLSX, start=OUT_DIR).replace("\\", "/")
@@ -383,14 +370,85 @@ def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int,
         cont = get_list_container(page, timeout_ms=list_timeout_ms)
         wait_rows_ready(cont)
 
-        # Effective start page for this shard: start_page + shard_index
+        # --- MODE A: process a specific set of pages (from --pages-file) ---
+        if target_pages:
+            # Ensure ascending unique pages
+            target_pages = sorted(set(target_pages))
+            for tp in target_pages:
+                try:
+                    cur = active_page_number(cont) or 1
+                    if cur != tp:
+                        log(f"[step] Jump to target page {tp} (current {cur}) …")
+                        fast_forward_to_page(cont, tp)
+                        cont, _ = recover_list(page, expected_page_no=tp, list_timeout_ms=list_timeout_ms)
+
+                    # process this page
+                    log(f"[page][shard {shard_index+1}/{shard_count}] Processing page {tp}")
+                    rows = cont.locator(ROW_SELECTOR)
+                    row_count = rows.count()
+                    log(f"[info] rows found: {row_count}")
+
+                    for r in range(row_count):
+                        try:
+                            rows = cont.locator(ROW_SELECTOR)
+                            row = rows.nth(r)
+                            eye = find_row_eye(row)
+                            if not eye:
+                                log(f"[skip] no 'view' action for row {r+1} on page {tp}")
+                                continue
+
+                            prev_html = tbody_html(cont)
+                            with page.expect_navigation():
+                                eye.click()
+                            try:
+                                record = extract_detail(page)
+                                log(f"[ok] extracted Activity ID={record.get('Activity ID', '?')}")
+                                per_file = save_row_to_excels(record)
+                                uploaded_rows += 1
+                                maybe_upload_activity(per_file)
+                                maybe_upload_master(force=False)
+                            except Exception as e:
+                                log(f"[warn] extraction failed on page {tp}, row {r+1}: {e}")
+
+                            try:
+                                page.get_by_role("button", name="Back", exact=True).click()
+                            except:
+                                page.go_back(wait_until="networkidle", timeout=60000)
+                            cont, _ = recover_list(page, expected_page_no=tp, list_timeout_ms=list_timeout_ms)
+                        except Exception as e:
+                            log(f"[warn] Row {r+1} failure on page {tp}: {e}")
+                            try:
+                                cont, _ = recover_list(page, expected_page_no=tp, list_timeout_ms=list_timeout_ms)
+                            except:
+                                continue
+
+                    maybe_upload_master(force=True)
+
+                    # honor --max-pages for this mode too (pages count per shard)
+                    if max_pages:
+                        processed_so_far = target_pages.index(tp) + 1
+                        if processed_so_far >= max_pages:
+                            log("[done] Reached --max-pages cap for this shard (pages-file mode).")
+                            break
+
+                except Exception as e:
+                    log(f"[warn] Could not complete target page {tp}: {e}")
+                    # try to recover to list (page number may be unknown now)
+                    try:
+                        cont, _ = recover_list(page, list_timeout_ms=list_timeout_ms)
+                    except:
+                        pass
+
+            maybe_upload_master(force=True)
+            browser.close()
+            return
+
+        # --- MODE B: legacy stride mode (no pages-file) ---
         eff_start = max(1, start_page) + (shard_index if shard_count > 1 else 0)
         if eff_start > 1:
             log(f"[step] Fast-forwarding to shard start page {eff_start} …")
-            try:
-                fast_forward_to_page(cont, eff_start)
-            except Exception as e:
-                log(f"[warn] Could not fast-forward neatly: {e}")
+            try: fast_forward_to_page(cont, eff_start)
+            except Exception as e: log(f"[warn] Could not fast-forward neatly: {e}")
 
         processed_pages = 0
         current_page = active_page_number(cont) or eff_start
@@ -424,28 +482,21 @@ def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int,
                     except Exception as e:
                         log(f"[warn] extraction failed on page {n}, row {r+1}: {e}")
 
-                    try:
-                        page.get_by_role("button", name="Back", exact=True).click()
-                    except:
-                        page.go_back(wait_until="networkidle", timeout=60000)
+                    try: page.get_by_role("button", name="Back", exact=True).click()
+                    except: page.go_back(wait_until="networkidle", timeout=60000)
                     cont, _ = recover_list(page, expected_page_no=n, list_timeout_ms=list_timeout_ms)
                 except Exception as e:
                     log(f"[warn] Row {r+1} failure: {e}")
-                    try:
-                        cont, _ = recover_list(page, expected_page_no=n, list_timeout_ms=list_timeout_ms)
-                    except:
-                        continue
+                    try: cont, _ = recover_list(page, expected_page_no=n, list_timeout_ms=list_timeout_ms)
+                    except: continue
 
             processed_pages += 1
             maybe_upload_master(force=True)
 
-            # Respect --max-pages as "pages for THIS shard"
             if max_pages and processed_pages >= max_pages:
                 log("[done] Reached --max-pages cap for this shard.")
                 break
 
-            # Move to the *next page for this shard*:
-            # stride = shard_count; from current page, advance N pages via 'next' button
             stride = shard_count if shard_count > 1 else 1
             if not click_next_k(cont, stride):
                 log("[done] Reached last page (or next disabled) for this shard.")
@@ -455,31 +506,30 @@ def main(max_pages:int, headless:bool, start_page:int, list_timeout_ms:int,
         maybe_upload_master(force=True)
         browser.close()
 
-
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-pages", type=int, default=0,
-                    help="How many pages THIS SHARD will process (0 = until paginator ends for this shard).")
+                    help="How many pages THIS SHARD will process (0 = until end; applies to pages-file mode too).")
     ap.add_argument("--start-page", type=int, default=1,
                     help="Global 1-based start page. With sharding, effective start = start-page + shard-index.")
-    ap.add_argument("--headless", action="store_true",
-                    help="Run headless.")
+    ap.add_argument("--headless", action="store_true", help="Run headless.")
     ap.add_argument("--list-timeout-ms", type=int, default=120000,
                     help="Timeout in ms to wait for <app-list-external-activities> to appear/settle.")
 
-    # S3 options (optional)
-    ap.add_argument("--s3-bucket", type=str, default="",
-                    help="If set, upload outputs to this S3 bucket.")
+    # Optional S3
+    ap.add_argument("--s3-bucket", type=str, default="", help="If set, upload outputs to this S3 bucket.")
     ap.add_argument("--s3-prefix", type=str, default="runs/current",
-                    help="Key prefix under which to place files (e.g., runs/2025-11-05).")
+                    help="Key prefix (e.g., runs/2025-11-05).")
     ap.add_argument("--s3-master-upload-every", type=int, default=25,
-                    help="Upload master Excel every N rows (plus end-of-page/end-of-run).")
+                    help="Upload master every N rows (plus end-of-page/end-of-run).")
 
     # Sharding
-    ap.add_argument("--shard-count", type=int, default=1,
-                    help="Total number of parallel shards (default 1 = no sharding).")
-    ap.add_argument("--shard-index", type=int, default=0,
-                    help="Zero-based index of this shard (0..shard-count-1).")
+    ap.add_argument("--shard-count", type=int, default=1, help="Total parallel shards.")
+    ap.add_argument("--shard-index", type=int, default=0, help="Zero-based shard index (0..count-1).")
+
+    # NEW: pages file
+    ap.add_argument("--pages-file", type=str, default="",
+                    help="Path to a text file listing EXACT pages to process (one per line, commas/spaces OK).")
 
     args = ap.parse_args()
     main(
@@ -492,4 +542,5 @@ if __name__ == "__main__":
         s3_master_every=max(1, args.s3_master_upload_every),
         shard_count=args.shard_count,
         shard_index=args.shard_index,
+        pages_file=(args.pages_file or None),
     )
